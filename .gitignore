@@ -6,3 +6,9 @@
 __pycache__/
 .pytest_cache/
 *-credentials.json
+
+# Local Docker/Compose/kind/act scratch output
+*.log
+*.tar
+uvicorn.pid
+kubeconfig.yaml

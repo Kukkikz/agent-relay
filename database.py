@@ -13,7 +13,18 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Generator
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, select
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    event,
+    select,
+    text,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -134,6 +145,14 @@ def _is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
 
 
+# A fixed key for Postgres's session-scoped advisory lock. Any writer
+# transaction (claim, heartbeat, terminal submission, recovery) takes this
+# lock for the duration of its transaction, giving the same single-writer
+# serialization SQLite gets from ``BEGIN IMMEDIATE``. A future optimization
+# could replace this coarse lock with per-task ``SELECT ... FOR UPDATE SKIP
+# LOCKED``, but the coarse lock keeps the storage seam a drop-in port.
+POSTGRES_ADVISORY_LOCK_KEY = 727373001
+
 engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
 if _is_sqlite(DATABASE_URL):
     engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
@@ -177,19 +196,24 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run one writer transaction before selecting or changing work.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    Claim, heartbeat, terminal submission, and recovery all use this single
+    seam so only one such transaction runs at a time, giving each task one
+    active lease. SQLite gets this from a ``BEGIN IMMEDIATE`` writer
+    reservation; PostgreSQL has no equivalent statement, so it takes a
+    session-scoped advisory lock as the first statement of the transaction
+    instead. Both approaches serialize writers identically from the caller's
+    perspective.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if _is_sqlite(DATABASE_URL):
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+        else:
+            connection.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": POSTGRES_ADVISORY_LOCK_KEY})
         yield session
         session.flush()
         connection.commit()

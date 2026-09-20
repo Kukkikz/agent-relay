@@ -9,11 +9,15 @@ not from a Python lock.
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 
 # Default to a scratch DB so `pytest` never resets the dev server's
 # `./agent-relay.db`. Respect an explicit RELAY_DATABASE_URL/DATABASE_URL
-# (e.g. CI pointing at PostgreSQL), but otherwise isolate tests.
-os.environ.setdefault("RELAY_DATABASE_URL", "sqlite:////tmp/agent-relay-test.db")
+# (e.g. CI pointing at PostgreSQL), but otherwise isolate tests. Use the
+# platform temp dir (not a hardcoded /tmp) so this works on Windows too.
+_scratch_db = Path(tempfile.gettempdir()) / "agent-relay-test.db"
+os.environ.setdefault("RELAY_DATABASE_URL", f"sqlite:///{_scratch_db.as_posix()}")
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -96,6 +100,62 @@ def test_protocol_idempotency_terminal_retry_and_auth_boundary():
         attempts = client.get(f"/api/v1/tasks/{task_id}/attempts", headers=sender_headers).json()
         assert attempts["items"][0]["outcome"] == "completed"
         assert "claim_token" not in attempts["items"][0]
+
+
+def test_acceptance_scenario_1_register_exchange_task_and_result():
+    """SPEC.md acceptance scenario 1: register two agents, one sends a task,
+    the other claims and completes it, and the sender reads the result.
+
+    Runs against the real FastAPI app and a real (scratch) SQLite database —
+    no mocked storage — mirroring the manual curl walkthrough."""
+    with TestClient(main.app) as client:
+        reviewer, reviewer_headers = register(client, "reviewer")
+        worker, worker_headers = register(client, "worker")
+
+        sent = client.post(
+            "/api/v1/tasks",
+            headers=reviewer_headers,
+            json={
+                "to": worker["agent_id"],
+                "input": "Review this Python function: def add(a,b): return a+b",
+            },
+        )
+        assert sent.status_code == 201
+        task = sent.json()
+        assert task["status"] == "queued"
+        task_id = task["task_id"]
+
+        claim = client.post(
+            "/api/v1/tasks/claim",
+            headers=worker_headers,
+            json={"worker_id": "scenario-worker-1", "wait_seconds": 0},
+        )
+        assert claim.status_code == 200
+        claim_data = claim.json()
+        assert claim_data["task_id"] == task_id
+        assert claim_data["from"] == reviewer["agent_id"]
+        assert claim_data["attempt"] == 1
+
+        complete = client.post(
+            f"/api/v1/tasks/{task_id}/complete",
+            headers=worker_headers,
+            json={
+                "claim_token": claim_data["claim_token"],
+                "output": "The function has no off-by-one issues; looks correct.",
+            },
+        )
+        assert complete.status_code == 200
+        assert complete.json() == {"task_id": task_id, "status": "completed"}
+
+        result = client.get(f"/api/v1/tasks/{task_id}", headers=reviewer_headers)
+        assert result.status_code == 200
+        result_data = result.json()
+        assert result_data["status"] == "completed"
+        assert result_data["output"] == "The function has no off-by-one issues; looks correct."
+        assert result_data["error"] is None
+        assert result_data["attempt_count"] == 1
+        assert result_data["from"] == reviewer["agent_id"]
+        assert result_data["to"] == worker["agent_id"]
 
 
 def test_sqlite_atomic_claims_distribute_without_overlap():
