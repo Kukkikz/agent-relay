@@ -121,46 +121,37 @@ jobs:
         if: ${{ env.ACT }}
         run: docker load -i agent-relay-image.tar
 
-      - name: Join the kind Docker network
-        if: ${{ env.ACT }}
-        # This job's container starts on its own default network, which
-        # can't resolve the kind node's container name. Attach it to the
-        # `kind` network (created by `kind create cluster`) so
-        # `${KIND_NODE}` resolves below. `hostname` isn't reliable here -
-        # under act's host network mode on Docker Desktop it can return the
-        # VM's own hostname ("docker-desktop") instead of this container's
-        # id - so read the id from this container's own mount path instead,
-        # which is unaffected by network mode.
-        run: |
-          container_id="$(grep -oE 'containers/[0-9a-f]{64}' /proc/self/mountinfo | head -n1 | cut -d/ -f2)"
-          docker network connect kind "$container_id"
-
       - name: Load the image into the kind node
         if: ${{ env.ACT }}
         env:
           TAG: ${{ needs.build.outputs.tag }}
         # kind has no daemon of its own; a node is a container running
         # containerd, so "loading" an image means importing it directly into
-        # that container's containerd content store via `docker cp` + `ctr`.
-        # This is what `kind load docker-image` does under the hood, done
-        # by hand here so the job needs nothing beyond the Docker CLI/socket.
-        run: |
-          docker save "$IMAGE_NAME:${TAG}" -o /tmp/agent-relay-image.tar
-          docker cp /tmp/agent-relay-image.tar "${KIND_NODE}:/tmp/agent-relay-image.tar"
-          docker exec "${KIND_NODE}" ctr -n k8s.io images import /tmp/agent-relay-image.tar
+        # that container's containerd content store via `ctr`. This is what
+        # `kind load docker-image` does under the hood, done by hand here so
+        # the job needs nothing beyond the Docker CLI/socket. Stream the
+        # save straight into the node's `ctr import` over stdin rather than
+        # writing an intermediate tar file first - simpler and avoids
+        # relying on this job container's own filesystem for anything.
+        run: docker save "$IMAGE_NAME:${TAG}" | docker exec -i "${KIND_NODE}" ctr -n k8s.io images import -
 
       - name: Configure kubectl for the kind cluster
         if: ${{ env.ACT }}
-        # The node's kubeconfig points at 127.0.0.1:<host-port>, which is
-        # only reachable from the Docker host, not from this job's own
-        # container. Rewrite it to the node's in-network hostname instead,
-        # resolvable now that the previous step joined the `kind` network.
+        # The node's own kubeconfig points at its container hostname
+        # (resolvable only on the `kind` Docker network, which this job's
+        # container can't join - Docker refuses to connect a container
+        # already using `--network host`, act's default, to any other
+        # network). Instead, rewrite it to the API server's *host-published*
+        # port: this job's container shares the Docker host's network
+        # namespace under host networking, so 127.0.0.1:<published-port> is
+        # already directly reachable, no network join required.
         run: |
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/kubectl
+          api_port="$(docker port "${KIND_NODE}" 6443/tcp | head -n1 | cut -d: -f2)"
           docker exec "${KIND_NODE}" cat /etc/kubernetes/admin.conf \
-            | sed "s#server: https://.*:6443#server: https://${KIND_NODE}:6443#" \
+            | sed "s#server: https://.*:6443#server: https://127.0.0.1:${api_port}#" \
             > kubeconfig.yaml
           echo "KUBECONFIG=$PWD/kubeconfig.yaml" >> "$GITHUB_ENV"
 
